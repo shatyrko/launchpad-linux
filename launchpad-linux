@@ -1,0 +1,1257 @@
+#!/usr/bin/env python3
+"""Launchpad Linux: the macOS Launchpad for a Wayland desktop (wlr-layer-shell).
+
+A full-screen overlay over the blurred desktop: every installed app as a big icon with its name, A to Z, in
+pages. Keyboard first: arrows move, Enter opens, Esc closes, typing the first letters of a name jumps to that
+app (like an app switcher), Page Up / Page Down change the page. The mouse works too: click an app, click the
+background to close, scroll or swipe for the next page. The pointer disappears the moment the keyboard is used,
+and hovering selects only after the mouse really moves, so a resting pointer never highlights an icon.
+
+Rearranging: press and hold an icon, then drag it. Drop it near another icon's edge to put it there, on an
+icon's middle to make a folder (or add to a folder); hold it at the screen edge to change page. Click a folder
+to open it, click its name to rename it, drag an icon out of it to take it out. Settings (the gear, or Ctrl+,)
+hides apps from Launchpad and sorts everything A to Z again. The layout is ~/.config/launchpad-linux/layout.json.
+
+It runs in the background with a (hidden) tray icon; starting it again toggles it. Colours come from the active
+Noctalia palette, the font from the GTK setting, the blur from the compositor (Umbriel layer rule for the
+namespace "launchpad-linux").
+
+    launchpad-linux               open / close it (starts the background program when it is not running)
+    launchpad-linux --background  only start the background program with the tray icon (login)
+    launchpad-linux --settings    open it with the settings
+    launchpad-linux --quit        stop the background program
+    launchpad-linux --list        print the apps it would show
+
+Needs: python-gobject, gtk4, gtk4-layer-shell.
+"""
+import ctypes.util
+import glob
+import json
+import math
+import os
+import sys
+import time
+import tomllib
+import urllib.parse
+
+HERE = os.path.dirname(os.path.realpath(__file__))
+sys.path.insert(0, HERE)
+
+# gtk4-layer-shell must be loaded before libwayland-client: re-exec with it preloaded
+LAYER = ctypes.util.find_library("gtk4-layer-shell") or next(iter(glob.glob("/usr/lib/libgtk4-layer-shell.so*")), None)
+if (LAYER and "libgtk4-layer-shell" not in os.environ.get("LD_PRELOAD", "") and "--list" not in sys.argv
+        and not os.environ.get("LP_NO_EXEC")):
+    os.environ["LD_PRELOAD"] = (LAYER if LAYER.startswith("/") else f"/usr/lib/{LAYER}") + \
+        (":" + os.environ["LD_PRELOAD"] if os.environ.get("LD_PRELOAD") else "")
+    os.execv(sys.executable, [sys.executable] + sys.argv)
+
+import gi  # noqa: E402
+
+gi.require_version("Gtk", "4.0")
+gi.require_version("Gdk", "4.0")
+from gi.repository import Gdk, Gio, GLib, Gtk, Pango  # noqa: E402
+
+try:
+    gi.require_version("Gtk4LayerShell", "1.0")
+    from gi.repository import Gtk4LayerShell as LayerShell  # noqa: E402
+except (ValueError, ImportError):
+    LayerShell = None
+
+from layout import AppEntry, Layout  # noqa: E402
+
+APP_ID = "dev.alecsh.LaunchpadLinux"
+NAMESPACE = "launchpad-linux"
+TYPE_RESET_S = 1.3          # typed letters are forgotten after this long without typing
+PAGE_COOLDOWN_S = 0.35      # scrolling changes one page per this
+SWIPE_PX = 70.0             # touchpad scroll distance for one page
+HOVER_PX = 4.0              # the pointer must move this far before hovering selects
+STARTUP_S = 0.6             # pointer events while the window opens (layout settling, compositor) are not movement
+LONG_PRESS_MS = 450         # press and hold this long to pick an icon up
+MOVE_CANCEL_PX = 9.0        # moving this far before that is a wiggle, not a pick-up
+EDGE_PX = 70                # holding a dragged icon this close to the screen edge turns the page
+EDGE_MS = 650
+
+# Catppuccin Mocha (Noctalia's own default) when no palette file can be read
+FALLBACK = {
+    "mPrimary": "#b4befe", "mOnPrimary": "#1e1e2e", "mSurface": "#1e1e2e", "mOnSurface": "#cdd6f4",
+    "mSurfaceVariant": "#313244", "mOnSurfaceVariant": "#a6adc8", "mOutline": "#6c7086", "mHover": "#45475a",
+    "mOnHover": "#cdd6f4", "mError": "#f38ba8",
+}
+
+
+def load_palette() -> dict:
+    """The colours of the palette Noctalia is using now (dark or light), else the fallback."""
+    theme = {}
+    for path in ("~/.config/noctalia/config.toml", "~/.local/state/noctalia/settings.toml"):   # the second wins
+        try:
+            with open(os.path.expanduser(path), "rb") as f:
+                theme.update(tomllib.load(f).get("theme", {}))
+        except (OSError, tomllib.TOMLDecodeError):
+            pass
+    mode = theme.get("shell_mode") or theme.get("mode") or "dark"
+    source = theme.get("source", "community")
+    candidates = []
+    if source == "community" and theme.get("community_palette"):
+        candidates.append(f"~/.local/state/noctalia/community-palettes/{urllib.parse.quote(theme['community_palette'])}.json")
+    if theme.get("custom_palette"):
+        candidates.append(f"~/.config/noctalia/palettes/{theme['custom_palette']}.json")
+    for path in candidates:
+        try:
+            with open(os.path.expanduser(path)) as f:
+                colors = json.load(f).get(mode)
+            if isinstance(colors, dict):
+                return {**FALLBACK, **{k: v for k, v in colors.items() if isinstance(v, str)}}
+        except (OSError, ValueError):
+            continue
+    return dict(FALLBACK)
+
+
+def rgba(hex_color: str, alpha: float) -> str:
+    h = hex_color.lstrip("#")
+    return f"rgba({int(h[0:2], 16)}, {int(h[2:4], 16)}, {int(h[4:6], 16)}, {alpha})"
+
+
+def make_css(p: dict, icon: int) -> str:
+    return f"""
+window.launchpad {{ background-color: {rgba(p['mSurface'], 0.52)}; }}
+.root {{ opacity: 0; transition: opacity 200ms ease-out; }}
+.root.in {{ opacity: 1; }}
+.pages {{ transition: opacity 160ms; }}
+.pages.dim {{ opacity: 0.28; }}
+.cell {{ border-radius: {int(icon * 0.24)}px; padding: 12px 6px 8px 6px; transition: background-color 90ms; }}
+.cell.selected {{ background-color: {rgba(p['mHover'], 0.62)}; box-shadow: inset 0 0 0 2px {rgba(p['mPrimary'], 0.55)}; }}
+.cell.ghosted {{ opacity: 0.25; }}
+.dragging .cell.selected {{ background: none; box-shadow: none; }}
+.cell.drop-in {{ background-color: {rgba(p['mPrimary'], 0.30)}; box-shadow: inset 0 0 0 2px {p['mPrimary']}; }}
+.cell.drop-before {{ box-shadow: inset 5px 0 0 0 {p['mPrimary']}; }}
+.cell.drop-after {{ box-shadow: inset -5px 0 0 0 {p['mPrimary']}; }}
+.cell .name {{ color: {p['mOnSurface']}; font-size: 15px; font-weight: 500; text-shadow: 0 1px 6px {rgba(p['mSurface'], 0.9)}; }}
+.folder-icon {{ background-color: {rgba(p['mSurfaceVariant'], 0.62)}; border-radius: {int(icon * 0.26)}px;
+  box-shadow: inset 0 0 0 1px {rgba(p['mOutline'], 0.55)}; padding: {int(icon * 0.09)}px; }}
+.ghost {{ opacity: 0.92; }}
+.typed {{ background-color: {rgba(p['mSurfaceVariant'], 0.86)}; color: {p['mOnSurface']}; border-radius: 999px;
+  padding: 9px 26px; font-size: 19px; box-shadow: inset 0 0 0 1px {rgba(p['mOutline'], 0.6)}; opacity: 0; transition: opacity 150ms; }}
+.typed.show {{ opacity: 1; }}
+button.dot {{ min-width: 9px; min-height: 9px; padding: 0; border-radius: 99px; border: none; box-shadow: none; background: none;
+  background-color: {rgba(p['mOnSurfaceVariant'], 0.35)}; transition: background-color 150ms; }}
+button.dot.on {{ background-color: {p['mPrimary']}; }}
+button.gear {{ background: none; border: none; box-shadow: none; color: {rgba(p['mOnSurfaceVariant'], 0.8)}; padding: 10px;
+  border-radius: 99px; }}
+button.gear:hover {{ background-color: {rgba(p['mHover'], 0.55)}; color: {p['mOnSurface']}; }}
+.panel {{ background-color: {rgba(p['mSurface'], 0.88)}; color: {p['mOnSurface']}; border-radius: 34px; padding: 22px 26px;
+  box-shadow: 0 18px 60px {rgba(p['mSurface'], 0.7)}, inset 0 0 0 1px {rgba(p['mOutline'], 0.6)}; }}
+.panel-title {{ font-size: 21px; font-weight: 600; background: none; box-shadow: none; border: none; color: {p['mOnSurface']};
+  caret-color: {p['mPrimary']}; }}
+.panel .meta {{ color: {p['mOnSurfaceVariant']}; font-size: 13px; }}
+.panel scrolledwindow, .panel list {{ background: none; }}
+.panel row {{ background: none; border-radius: 14px; }}
+.panel row:hover {{ background-color: {rgba(p['mHover'], 0.4)}; }}
+.panel entry, .panel searchentry {{ background-color: {rgba(p['mSurfaceVariant'], 0.8)}; color: {p['mOnSurface']};
+  border-radius: 14px; box-shadow: inset 0 0 0 1px {rgba(p['mOutline'], 0.5)}; }}
+.panel entry.panel-title {{ background: none; box-shadow: none; }}
+.panel button.text {{ background-color: {rgba(p['mSurfaceVariant'], 0.9)}; color: {p['mOnSurface']}; border-radius: 14px;
+  border: none; box-shadow: inset 0 0 0 1px {rgba(p['mOutline'], 0.5)}; padding: 8px 16px; }}
+.panel button.text:hover {{ background-color: {rgba(p['mHover'], 0.9)}; }}
+.panel switch {{ background-color: {rgba(p['mOutline'], 0.55)}; border-radius: 99px; }}
+.panel switch:checked {{ background-color: {p['mPrimary']}; }}
+.panel switch slider {{ background-color: {p['mOnSurface']}; border-radius: 99px; }}
+.panel switch:checked slider {{ background-color: {p['mOnPrimary']}; }}
+"""
+
+
+class AppItem:
+    def __init__(self, info: Gio.AppInfo):
+        self.info = info
+        self.name = info.get_display_name() or info.get_name() or info.get_id() or "?"
+        self.key = self.name.casefold()
+        self.id = info.get_id() or self.name
+
+
+def load_apps() -> list:
+    seen, apps = set(), []
+    for info in Gio.AppInfo.get_all():
+        if not info.should_show():
+            continue
+        ident = info.get_id() or ""
+        if ident.startswith(APP_ID) or ident in seen:
+            continue
+        seen.add(ident)
+        apps.append(AppItem(info))
+    apps.sort(key=lambda a: a.key)
+    return apps
+
+
+def icon_for(app: AppItem) -> Gio.Icon:
+    return app.info.get_icon() or Gio.ThemedIcon.new("application-x-executable")
+
+
+def make_icon(entry, icon: int) -> Gtk.Widget:
+    """The picture of an app, or of a folder (a rounded square with up to nine small icons)."""
+    if entry.kind == "folder":
+        box = Gtk.Box()
+        box.add_css_class("folder-icon")
+        box.set_size_request(icon, icon)
+        box.set_halign(Gtk.Align.CENTER)
+        box.set_valign(Gtk.Align.CENTER)          # stays square in a taller cell
+        grid = Gtk.Grid()
+        grid.set_row_homogeneous(True)
+        grid.set_column_homogeneous(True)
+        grid.set_hexpand(True)
+        grid.set_vexpand(True)
+        mini = max(16, int(icon * 0.26))
+        for n, app in enumerate(entry.apps[:9]):
+            img = Gtk.Image.new_from_gicon(icon_for(app))
+            img.set_pixel_size(mini)
+            grid.attach(img, n % 3, n // 3, 1, 1)
+        box.append(grid)
+        return box
+    image = Gtk.Image.new_from_gicon(icon_for(entry.app))
+    image.set_pixel_size(icon)
+    image.set_halign(Gtk.Align.CENTER)
+    return image
+
+
+class Cell(Gtk.Box):
+    """One app or folder in a grid: the picture over its name."""
+
+    def __init__(self, entry, icon: int, width: int, height: int):
+        super().__init__(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+        self.entry = entry
+        self.icon_px = icon
+        self.add_css_class("cell")
+        self.set_size_request(width, height)
+        self.set_halign(Gtk.Align.CENTER)
+        self.set_valign(Gtk.Align.CENTER)
+        self.append(make_icon(entry, icon))
+        label = Gtk.Label(label=entry.name)
+        label.add_css_class("name")
+        label.set_ellipsize(Pango.EllipsizeMode.END)
+        label.set_max_width_chars(18)
+        label.set_lines(1)
+        label.set_halign(Gtk.Align.CENTER)
+        self.append(label)
+
+
+def ancestor(widget, kind):
+    while widget is not None and not isinstance(widget, kind):
+        widget = widget.get_parent()
+    return widget
+
+
+def has_class(widget, css):
+    while widget is not None:
+        if widget.has_css_class(css):
+            return True
+        widget = widget.get_parent()
+    return False
+
+
+INTERACTIVE = (Gtk.Button, Gtk.Switch, Gtk.Entry, Gtk.Text, Gtk.SearchEntry, Gtk.ScrolledWindow, Gtk.ListBox, Gtk.Scrollbar)
+
+
+class Launchpad(Gtk.ApplicationWindow):
+    def __init__(self, app, apps, palette, layout, settings=False):
+        super().__init__(application=app)
+        self.apps, self.palette, self.layout = apps, palette, layout
+        self.open_settings_at_start = settings
+        self.add_css_class("launchpad")
+        self.entries = []          # the root entries on show (layout.root)
+        self.cells = []
+        self.sel = 0
+        self.page = 0
+        self.cols = self.rows = self.per = 1
+        self.pages = []
+        self.dots = []
+        self.icon = 96
+        self.cell_w = self.cell_h = 100
+        self.W = self.H = 0
+        self.typed = ""
+        self.type_timer = 0
+        self.armed = False         # hovering selects only after the mouse really moves (a resting pointer must not select)
+        self.last_ptr = None
+        self.base_ptr = None
+        self.last_scroll = 0.0
+        self.scroll_acc = 0.0
+        self.was_active = False
+        self.closing = False
+        self.opened = time.monotonic()
+        self.folder = None         # the folder whose panel is open
+        self.fpanel = None
+        self.ftitle = None
+        self.fcells = []
+        self.fsel = 0
+        self.fcols = 1
+        self.spanel = None         # the settings panel
+        self.pending = None        # a press on an icon that may become a pick-up or a click
+        self.drag = None
+        self.edge_timer = 0
+
+        if LayerShell is not None and LayerShell.is_supported():
+            LayerShell.init_for_window(self)
+            LayerShell.set_namespace(self, NAMESPACE)
+            LayerShell.set_layer(self, LayerShell.Layer.OVERLAY)
+            for edge in (LayerShell.Edge.TOP, LayerShell.Edge.BOTTOM, LayerShell.Edge.LEFT, LayerShell.Edge.RIGHT):
+                LayerShell.set_anchor(self, edge, True)
+            LayerShell.set_exclusive_zone(self, -1)
+            LayerShell.set_keyboard_mode(self, LayerShell.KeyboardMode.EXCLUSIVE)
+        else:
+            self.fullscreen()
+
+        self.overlay = Gtk.Overlay()
+        self.set_child(self.overlay)
+        self.root = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        self.root.add_css_class("root")
+        self.root.set_hexpand(True)
+        self.root.set_vexpand(True)
+        self.overlay.set_child(self.root)
+
+        # keyboard (capture phase: it must work whatever has focus), pointer, scroll, raw buttons for press-and-hold
+        keys = Gtk.EventControllerKey()
+        keys.set_propagation_phase(Gtk.PropagationPhase.CAPTURE)
+        keys.connect("key-pressed", self.on_key)
+        self.add_controller(keys)
+        motion = Gtk.EventControllerMotion()
+        motion.connect("motion", self.on_motion)
+        motion.connect("enter", self.on_motion)
+        self.add_controller(motion)
+        scroll = Gtk.EventControllerScroll(flags=Gtk.EventControllerScrollFlags.BOTH_AXES)
+        scroll.connect("scroll", self.on_scroll)
+        self.add_controller(scroll)
+        legacy = Gtk.EventControllerLegacy()
+        legacy.set_propagation_phase(Gtk.PropagationPhase.CAPTURE)
+        legacy.connect("event", self.on_event)
+        self.add_controller(legacy)
+        self.connect("notify::is-active", self.on_active)
+        self.add_tick_callback(self.wait_for_size)
+
+    # -- building the pages, once the compositor has given us the screen size ----------------------------------
+
+    def wait_for_size(self, widget, clock):
+        w, h = self.get_width(), self.get_height()
+        if w < 200 or h < 200:
+            return GLib.SOURCE_CONTINUE
+        self.build(w, h)
+        return GLib.SOURCE_REMOVE
+
+    def build(self, w, h):
+        self.W, self.H = w, h
+        self.icon = max(64, min(176, int(h * 0.105)))
+        nominal_w, nominal_h = int(self.icon * 1.75), self.icon + 64
+        css = Gtk.CssProvider()
+        css.load_from_string(make_css(self.palette, self.icon))
+        Gtk.StyleContext.add_provider_for_display(self.get_display(), css, Gtk.STYLE_PROVIDER_PRIORITY_USER)
+
+        top, bottom = 84, 70
+        # how many fit with comfortable room; then the cells are spread over the whole screen
+        self.cols = max(2, int(w * 0.92 // nominal_w))
+        self.rows = max(1, int((h - top - bottom - 24) // nominal_h))
+        self.per = self.cols * self.rows
+        grid_w, grid_h = int(w * 0.965), h - top - bottom
+        self.cell_w, self.cell_h = grid_w // self.cols, grid_h // self.rows
+        self.grid_size = (self.cols * self.cell_w, self.rows * self.cell_h)
+
+        self.pill = Gtk.Label(label="")
+        self.pill.add_css_class("typed")
+        pill_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL)
+        pill_box.set_size_request(-1, top)
+        pill_box.set_halign(Gtk.Align.CENTER)
+        pill_box.set_valign(Gtk.Align.CENTER)
+        pill_box.append(self.pill)
+        self.root.append(pill_box)
+
+        self.stack = Gtk.Stack()
+        self.stack.add_css_class("pages")
+        self.stack.set_transition_type(Gtk.StackTransitionType.SLIDE_LEFT_RIGHT)
+        self.stack.set_transition_duration(280)
+        self.stack.set_hexpand(True)
+        self.stack.set_vexpand(True)
+        self.stack.set_halign(Gtk.Align.CENTER)
+        self.stack.set_valign(Gtk.Align.CENTER)
+        self.root.append(self.stack)
+
+        self.dots_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=14)
+        self.dots_box.set_halign(Gtk.Align.CENTER)
+        self.dots_box.set_valign(Gtk.Align.CENTER)
+        self.dots_box.set_size_request(-1, bottom)
+        self.root.append(self.dots_box)
+
+        # on top of everything: the dragged icon, and the settings gear
+        self.ghost_layer = Gtk.Fixed()
+        self.ghost_layer.set_can_target(False)
+        self.overlay.add_overlay(self.ghost_layer)
+        gear = Gtk.Button.new_from_icon_name("emblem-system-symbolic")
+        gear.add_css_class("gear")
+        gear.set_halign(Gtk.Align.END)
+        gear.set_valign(Gtk.Align.END)
+        gear.set_margin_end(26)
+        gear.set_margin_bottom(20)
+        gear.set_focusable(False)
+        gear.set_tooltip_text("Settings (Ctrl+,)")
+        gear.connect("clicked", lambda b: self.open_settings())
+        self.overlay.add_overlay(gear)
+
+        self.build_pages()
+        self.select(0, animate=False)
+        GLib.idle_add(lambda: self.root.add_css_class("in"))
+        if self.open_settings_at_start:
+            GLib.idle_add(self.open_settings)
+
+    def make_cell(self, entry, icon=None, w=None, h=None):
+        cell = Cell(entry, icon or self.icon, w or self.cell_w, h or self.cell_h)
+        motion = Gtk.EventControllerMotion()
+        motion.connect("enter", lambda c, x, y, cell=cell: self.on_cell_hover(cell))
+        cell.add_controller(motion)
+        return cell
+
+    @staticmethod
+    def clear(box):
+        child = box.get_first_child()
+        while child is not None:
+            nxt = child.get_next_sibling()
+            box.remove(child)
+            child = nxt
+
+    def build_pages(self, keep=None):
+        """(Re)create every page from the layout; keep = the entry to select afterwards."""
+        if keep is None and self.entries and 0 <= self.sel < len(self.entries):
+            keep = self.entries[self.sel]
+        self.clear(self.stack)
+        self.entries = list(self.layout.root)
+        self.cells, self.pages = [], []
+        count = max(1, math.ceil(len(self.entries) / self.per))
+        for page in range(count):
+            grid = Gtk.Grid()
+            grid.set_halign(Gtk.Align.CENTER)
+            grid.set_valign(Gtk.Align.START)
+            grid.set_column_homogeneous(True)
+            grid.set_row_homogeneous(True)
+            grid.set_size_request(*self.grid_size)
+            self.stack.add_named(grid, f"p{page}")
+            self.pages.append(grid)
+        for i, entry in enumerate(self.entries):
+            cell = self.make_cell(entry)
+            self.cells.append(cell)
+            local = i % self.per
+            self.pages[i // self.per].attach(cell, local % self.cols, local // self.cols, 1, 1)
+        self.clear(self.dots_box)
+        self.dots = []
+        for page in range(count):
+            dot = Gtk.Button()
+            dot.add_css_class("dot")
+            dot.set_focusable(False)
+            dot.set_valign(Gtk.Align.CENTER)
+            dot.connect("clicked", lambda b, page=page: self.go_page(page))
+            self.dots_box.append(dot)
+            self.dots.append(dot)
+        self.dots_box.set_visible(count > 1)
+        index = self.entries.index(keep) if keep in self.entries else min(self.sel, max(0, len(self.entries) - 1))
+        self.sel = index
+        self.page = -1
+        if self.cells:
+            self.select_root(index, animate=False)
+
+    # -- selection and pages -------------------------------------------------------------------------------------
+
+    def select(self, index, animate=True):
+        if self.folder is not None:
+            self.select_in_folder(index)
+        else:
+            self.select_root(index, animate)
+
+    def select_root(self, index, animate=True):
+        if not self.cells:
+            return
+        index = max(0, min(len(self.cells) - 1, index))
+        if 0 <= self.sel < len(self.cells):
+            self.cells[self.sel].remove_css_class("selected")
+        self.sel = index
+        self.cells[index].add_css_class("selected")
+        page = index // self.per
+        if page != self.page:
+            animated = animate and self.page >= 0
+            self.page = page
+            self.stack.set_transition_type(Gtk.StackTransitionType.SLIDE_LEFT_RIGHT if animated else Gtk.StackTransitionType.NONE)
+            self.stack.set_visible_child_name(f"p{page}")
+            self.stack.set_transition_type(Gtk.StackTransitionType.SLIDE_LEFT_RIGHT)
+        for n, dot in enumerate(self.dots):
+            (dot.add_css_class if n == page else dot.remove_css_class)("on")
+
+    def go_page(self, page):
+        if self.folder is not None or self.spanel is not None:
+            return
+        page = max(0, min(len(self.pages) - 1, page))
+        if page != self.page and self.cells:
+            self.select_root(min(len(self.cells) - 1, page * self.per + (self.sel % self.per)))
+
+    def move(self, dx, dy):
+        if self.folder is not None:
+            self.move_in_folder(dx, dy)
+            return
+        page_first = self.page * self.per
+        page_last = min(len(self.cells), page_first + self.per) - 1
+        if dx:
+            self.select_root(self.sel + dx)
+        elif dy:
+            target = self.sel + dy * self.cols
+            if page_first <= target <= page_last:
+                self.select_root(target)
+            elif dy > 0 and self.sel < page_last and (self.sel - page_first) // self.cols < (page_last - page_first) // self.cols:
+                self.select_root(page_last)          # a shorter last row: land on its last app
+
+    # -- keyboard --------------------------------------------------------------------------------------------------
+
+    def keyboard_used(self):
+        """The keyboard is in charge: hide the pointer and ignore hovering until the mouse really moves."""
+        self.armed = False
+        self.base_ptr = self.last_ptr
+        self.set_cursor_from_name("none")
+
+    def title_focused(self):
+        return self.ftitle is not None and ancestor(self.get_focus(), Gtk.Entry) is self.ftitle
+
+    def on_key(self, ctrl, keyval, keycode, state):
+        name = Gdk.keyval_name(keyval) or ""
+        if state & Gdk.ModifierType.CONTROL_MASK and name == "comma":
+            self.open_settings()
+            return Gdk.EVENT_STOP
+        if self.spanel is not None:                        # the settings: typing goes to its search box
+            if name == "Escape":
+                self.close_settings()
+                return Gdk.EVENT_STOP
+            return Gdk.EVENT_PROPAGATE
+        if self.title_focused():                           # renaming a folder
+            if name in ("Return", "KP_Enter", "Escape"):
+                self.commit_folder_name()
+                self.set_focus(None)
+                return Gdk.EVENT_STOP
+            return Gdk.EVENT_PROPAGATE
+        if not self.cells:
+            return Gdk.EVENT_STOP
+        if state & (Gdk.ModifierType.CONTROL_MASK | Gdk.ModifierType.ALT_MASK | Gdk.ModifierType.SUPER_MASK):
+            return Gdk.EVENT_PROPAGATE
+        self.keyboard_used()
+        self.cancel_press()
+        if name == "Escape":
+            if self.typed:
+                self.clear_typed()
+            elif self.folder is not None:
+                self.close_folder()
+            else:
+                self.close_pad()
+        elif name in ("Return", "KP_Enter", "ISO_Enter"):
+            self.activate_current()
+        elif name == "Left":
+            self.move(-1, 0)
+        elif name == "Right":
+            self.move(1, 0)
+        elif name == "Up":
+            self.move(0, -1)
+        elif name == "Down":
+            self.move(0, 1)
+        elif name in ("Tab", "ISO_Left_Tab"):
+            count = len(self.fcells) if self.folder is not None else len(self.cells)
+            cur = self.fsel if self.folder is not None else self.sel
+            self.select((cur + (-1 if name == "ISO_Left_Tab" or state & Gdk.ModifierType.SHIFT_MASK else 1)) % count)
+        elif name in ("Page_Down", "KP_Page_Down"):
+            self.go_page(self.page + 1)
+        elif name in ("Page_Up", "KP_Page_Up"):
+            self.go_page(self.page - 1)
+        elif name in ("Home", "KP_Home"):
+            self.select(0)
+        elif name in ("End", "KP_End"):
+            self.select((len(self.fcells) if self.folder is not None else len(self.cells)) - 1)
+        elif name == "BackSpace":
+            if self.typed:
+                self.set_typed(self.typed[:-1])
+        else:
+            ch = chr(Gdk.keyval_to_unicode(keyval)) if Gdk.keyval_to_unicode(keyval) else ""
+            if ch and ch.isprintable() and not (ch == " " and not self.typed):
+                self.set_typed(self.typed + ch)
+        return Gdk.EVENT_STOP
+
+    def activate_current(self):
+        if self.folder is not None:
+            if self.fcells:
+                self.launch(self.fcells[self.fsel].entry.app)
+        elif self.entries:
+            self.activate_entry(self.entries[self.sel])
+
+    def activate_entry(self, entry):
+        if entry.kind == "folder":
+            self.open_folder(entry)
+        else:
+            self.launch(entry.app)
+
+    # -- type to select ----------------------------------------------------------------------------------------------
+
+    def set_typed(self, text):
+        self.typed = text
+        self.pill.set_label(text)
+        (self.pill.add_css_class if text else self.pill.remove_css_class)("show")
+        if self.type_timer:
+            GLib.source_remove(self.type_timer)
+        self.type_timer = GLib.timeout_add(int(TYPE_RESET_S * 1000), self.clear_typed) if text else 0
+        if text:
+            self.jump(text)
+
+    def clear_typed(self):
+        self.typed = ""
+        self.type_timer = 0
+        self.pill.remove_css_class("show")
+        return GLib.SOURCE_REMOVE
+
+    def jump(self, text):
+        q = text.casefold()
+        if self.folder is not None:
+            keys, cur = [c.entry.key for c in self.fcells], self.fsel
+        else:
+            keys, cur = [e.key for e in self.entries], self.sel
+        order = range(len(keys))
+        hit = next((i for i in order if keys[i].startswith(q)), None)
+        if hit is None and len(set(q)) == 1:        # "cc": cycle through the ones starting with "c"
+            starts = [i for i in order if keys[i].startswith(q[0])]
+            if starts:
+                hit = ([i for i in starts if i > cur] or starts)[0]
+        if hit is None:                              # a later word: "code" finds "Visual Studio Code"
+            hit = next((i for i in order if any(w.startswith(q) for w in keys[i].replace("-", " ").split())), None)
+        if hit is not None:
+            self.select(hit)
+
+    # -- pointer: hover, press and hold, drag ---------------------------------------------------------------------
+
+    def on_motion(self, ctrl, x, y):
+        self.last_ptr = (x, y)
+        if time.monotonic() - self.opened < STARTUP_S:
+            self.base_ptr = (x, y)
+            return
+        if self.base_ptr is None:
+            self.base_ptr = (x, y)                  # the pointer was already there: not a movement
+            return
+        if not self.armed and math.hypot(x - self.base_ptr[0], y - self.base_ptr[1]) > HOVER_PX:
+            self.armed = True
+            self.set_cursor(None)
+
+    def on_cell_hover(self, cell):
+        if not self.armed or self.drag is not None:
+            return
+        if self.folder is not None:
+            if cell in self.fcells:
+                self.select_in_folder(self.fcells.index(cell))
+        elif cell in self.cells and self.spanel is None:
+            self.select_root(self.cells.index(cell))
+
+    @staticmethod
+    def event_xy(event):
+        pos = event.get_position()
+        return (pos[-2], pos[-1])
+
+    def classify(self, x, y):
+        """What is at (x, y): ("cell", Cell), ("interactive", None), ("panel", None) or ("background", None)."""
+        widget = self.pick(x, y, Gtk.PickFlags.DEFAULT)
+        if widget is None:
+            return ("background", None)
+        cell = ancestor(widget, Cell)
+        if cell is not None and self.spanel is None:
+            return ("cell", cell)
+        if ancestor(widget, INTERACTIVE) is not None:
+            return ("interactive", None)
+        if has_class(widget, "panel"):
+            return ("panel", None)
+        return ("background", None)
+
+    def on_event(self, ctrl, event=None):
+        event = ctrl.get_current_event()
+        if event is None:
+            return False
+        kind = event.get_event_type()
+        if kind == Gdk.EventType.BUTTON_PRESS and event.get_button() == 1:
+            x, y = self.event_xy(event)
+            what, cell = self.classify(x, y)
+            if what == "cell" and self.cells:
+                self.cancel_press()
+                timer = GLib.timeout_add(LONG_PRESS_MS, self.begin_drag)
+                self.pending = {"cell": cell, "x": x, "y": y, "timer": timer, "bg": False}
+                return True
+            if what == "background":
+                self.cancel_press()
+                self.pending = {"cell": None, "x": x, "y": y, "timer": 0, "bg": True}
+                return True
+            return False
+        if kind == Gdk.EventType.BUTTON_RELEASE and event.get_button() == 1:
+            x, y = self.event_xy(event)
+            if self.drag is not None:
+                self.end_drag(x, y)
+                return True
+            pending, self.pending = self.pending, None
+            if pending is not None:
+                if pending["timer"]:
+                    GLib.source_remove(pending["timer"])
+                if pending["cell"] is not None:
+                    if self.folder is None:
+                        self.activate_entry(pending["cell"].entry)
+                    else:
+                        self.launch(pending["cell"].entry.app)
+                elif pending["bg"]:
+                    self.background_click()
+                return True
+            return False
+        if kind == Gdk.EventType.MOTION_NOTIFY:
+            x, y = self.event_xy(event)
+            if self.pending is not None and self.pending["cell"] is not None:
+                if math.hypot(x - self.pending["x"], y - self.pending["y"]) > MOVE_CANCEL_PX:
+                    self.cancel_press()
+            if self.drag is not None:
+                self.drag_to(x, y)
+            return False
+        return False
+
+    def cancel_press(self):
+        """Forget a press that was waiting to become a pick-up (it was moved or a key was pressed)."""
+        if self.pending is not None and self.pending["timer"]:
+            GLib.source_remove(self.pending["timer"])
+        self.pending = None
+
+    def background_click(self):
+        if self.spanel is not None:
+            self.close_settings()
+        elif self.folder is not None:
+            self.close_folder()
+        else:
+            self.close_pad()
+
+    def begin_drag(self):
+        pending, self.pending = self.pending, None
+        if pending is None or pending["cell"] is None or self.drag is not None:
+            return GLib.SOURCE_REMOVE
+        cell = pending["cell"]
+        size = int(cell.icon_px * 1.08)
+        ghost = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        ghost.add_css_class("ghost")
+        ghost.append(make_icon(cell.entry, size))
+        self.ghost_layer.put(ghost, pending["x"] - size / 2, pending["y"] - size / 2)
+        cell.add_css_class("ghosted")
+        self.root.add_css_class("dragging")
+        self.drag = {"entry": cell.entry, "cell": cell, "folder": self.folder, "ghost": ghost, "size": size, "target": None}
+        self.armed = True                          # the mouse is in charge now
+        self.set_cursor(None)
+        return GLib.SOURCE_REMOVE
+
+    def drag_to(self, x, y):
+        d = self.drag
+        self.ghost_layer.move(d["ghost"], x - d["size"] / 2, y - d["size"] / 2)
+        self.clear_drop_marks()
+        d["target"] = self.drop_target(x, y)
+        if d["target"] is not None:
+            action, cell = d["target"]
+            if cell is not None:
+                cell.add_css_class({"into": "drop-in", "before": "drop-before", "after": "drop-after"}[action])
+        # at the screen edge: turn the page
+        if self.folder is None and (x < EDGE_PX or x > self.W - EDGE_PX):
+            if not self.edge_timer:
+                self.edge_timer = GLib.timeout_add(EDGE_MS, self.edge_flip, -1 if x < EDGE_PX else 1)
+        elif self.edge_timer:
+            GLib.source_remove(self.edge_timer)
+            self.edge_timer = 0
+
+    def edge_flip(self, direction):
+        if self.drag is None or self.folder is not None:
+            self.edge_timer = 0
+            return GLib.SOURCE_REMOVE
+        self.go_page(self.page + direction)
+        return GLib.SOURCE_CONTINUE
+
+    def clear_drop_marks(self):
+        for cell in self.cells + self.fcells:
+            for css in ("drop-in", "drop-before", "drop-after"):
+                cell.remove_css_class(css)
+
+    def drop_target(self, x, y):
+        """("into" | "before" | "after", cell), ("end", None), ("leave", None) or None."""
+        d = self.drag
+        widget = self.pick(x, y, Gtk.PickFlags.DEFAULT)
+        cell = ancestor(widget, Cell) if widget is not None else None
+        if self.folder is not None:
+            if cell is None or cell is d["cell"] or cell not in self.fcells:
+                return ("end", None) if has_class(widget, "panel") else ("leave", None)
+        elif cell is None or cell is d["cell"] or cell not in self.cells:
+            return ("end", None) if widget is not None else None
+        ok, rect = cell.compute_bounds(self)
+        if not ok:
+            return None
+        dx = (x - rect.get_x()) / max(1.0, rect.get_width())
+        in_icon = (y - rect.get_y()) < cell.icon_px + 24
+        if self.folder is None and 0.28 < dx < 0.72 and in_icon and d["entry"].kind != "folder":
+            return ("into", cell)
+        return ("before" if dx < 0.5 else "after", cell)
+
+    def end_drag(self, x, y):
+        target = self.drop_target(x, y)              # while the drag state still exists
+        d, self.drag = self.drag, None
+        if self.edge_timer:
+            GLib.source_remove(self.edge_timer)
+            self.edge_timer = 0
+        self.clear_drop_marks()
+        self.ghost_layer.remove(d["ghost"])
+        d["cell"].remove_css_class("ghosted")
+        self.root.remove_css_class("dragging")
+        self.apply_drop(d, target)
+
+    def apply_drop(self, d, target):
+        lay = self.layout
+        entry, folder = d["entry"], d["folder"]
+        if target is None:
+            return
+        action, cell = target
+        if folder is not None:                                    # an app taken from the open folder
+            app = entry.app
+            if action in ("before", "after") and cell is not None:
+                lay.reorder_in_folder(folder, app, action == "before", cell.entry.app)
+                self.refresh_folder(select_app=app)
+            elif action == "end":
+                lay.reorder_in_folder(folder, app, False, None)
+                self.refresh_folder(select_app=app)
+            else:                                                # out of the folder, into the root
+                moved = lay.detach(app=app, folder=folder)
+                lay.insert(moved, lay.root.index(folder) + 1 if folder in lay.root else len(lay.root))
+                self.close_folder(rebuild=False)
+                self.build_pages(keep=moved)
+            return
+        if action == "end":                                       # onto empty space: last on this page
+            page_entries = self.entries[self.page * self.per:(self.page + 1) * self.per]
+            last = next((e for e in reversed(page_entries) if e is not entry), None)
+            lay.move(entry, False, last)
+        elif action == "into" and cell is not None:
+            target_entry = cell.entry
+            lay.detach(entry=entry)
+            if target_entry.kind == "folder":
+                lay.add_to_folder(target_entry, entry)
+                entry = target_entry
+            else:
+                entry = lay.make_folder(target_entry, entry)
+        elif cell is not None:
+            lay.move(entry, action == "before", cell.entry)
+        self.build_pages(keep=entry)
+
+    # -- folders ------------------------------------------------------------------------------------------------------
+
+    def open_folder(self, folder):
+        self.close_folder(rebuild=False)
+        self.folder = folder
+        panel = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=14)
+        panel.add_css_class("panel")
+        panel.set_halign(Gtk.Align.CENTER)
+        panel.set_valign(Gtk.Align.CENTER)
+        title = Gtk.Entry()
+        title.add_css_class("panel-title")
+        title.set_text(folder.name)
+        title.set_alignment(0.5)
+        title.set_has_frame(False)
+        title.connect("activate", lambda e: (self.commit_folder_name(), self.set_focus(None)))
+        panel.append(title)
+        self.ftitle = title
+        self.fpanel = panel
+        self.fgrid_box = Gtk.Box()
+        panel.append(self.fgrid_box)
+        self.overlay.add_overlay(panel)
+        self.stack.add_css_class("dim")
+        self.fsel = -1
+        self.fill_folder()
+        self.set_focus(None)
+
+    def fill_folder(self, select_app=None):
+        self.clear(self.fgrid_box)
+        folder = self.folder
+        icon = int(self.icon * 0.86)
+        w, h = int(icon * 1.7), icon + 58
+        n = len(folder.apps)
+        self.fcols = max(3, min(6, math.ceil(math.sqrt(n * 1.6))))
+        grid = Gtk.Grid()
+        grid.set_column_homogeneous(True)
+        grid.set_row_homogeneous(True)
+        self.fcells = []
+        for i, app in enumerate(folder.apps):
+            cell = self.make_cell(AppEntry(app), icon, w, h)
+            grid.attach(cell, i % self.fcols, i // self.fcols, 1, 1)
+            self.fcells.append(cell)
+        self.fgrid_box.append(grid)
+        index = next((i for i, a in enumerate(folder.apps) if a is select_app), max(0, min(self.fsel, n - 1)))
+        self.fsel = -1
+        self.select_in_folder(index)
+
+    def refresh_folder(self, select_app=None):
+        if self.folder is None:
+            return
+        if self.folder not in self.layout.root:                  # it dissolved
+            self.close_folder()
+            return
+        self.fill_folder(select_app)
+
+    def select_in_folder(self, index):
+        if not self.fcells:
+            return
+        index = max(0, min(len(self.fcells) - 1, index))
+        if 0 <= self.fsel < len(self.fcells):
+            self.fcells[self.fsel].remove_css_class("selected")
+        self.fsel = index
+        self.fcells[index].add_css_class("selected")
+
+    def move_in_folder(self, dx, dy):
+        n = len(self.fcells)
+        if dx:
+            self.select_in_folder(self.fsel + dx)
+        elif dy:
+            target = self.fsel + dy * self.fcols
+            if 0 <= target < n:
+                self.select_in_folder(target)
+            elif dy > 0 and self.fsel < n - 1 and self.fsel // self.fcols < (n - 1) // self.fcols:
+                self.select_in_folder(n - 1)
+
+    def commit_folder_name(self):
+        if self.folder is not None and self.ftitle is not None and self.folder in self.layout.root:
+            self.layout.rename_folder(self.folder, self.ftitle.get_text())
+
+    def close_folder(self, rebuild=True):
+        if self.fpanel is None:
+            self.folder = None
+            return
+        self.commit_folder_name()
+        self.overlay.remove_overlay(self.fpanel)
+        self.fpanel = None
+        self.ftitle = None
+        self.folder = None
+        self.fcells = []
+        self.stack.remove_css_class("dim")
+        if rebuild and self.cells:
+            self.build_pages()
+        self.set_focus(None)
+
+    # -- settings ---------------------------------------------------------------------------------------------------------
+
+    def open_settings(self):
+        if self.spanel is not None:
+            return
+        self.close_folder()
+        self.cancel_press()
+        panel = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
+        panel.add_css_class("panel")
+        panel.set_halign(Gtk.Align.CENTER)
+        panel.set_valign(Gtk.Align.CENTER)
+        head = Gtk.Box(spacing=10)
+        title = Gtk.Label(label="Launchpad settings", xalign=0)
+        title.add_css_class("panel-title")
+        title.set_hexpand(True)
+        head.append(title)
+        done = Gtk.Button(label="Done")
+        done.add_css_class("text")
+        done.connect("clicked", lambda b: self.close_settings())
+        head.append(done)
+        panel.append(head)
+        hint = Gtk.Label(label="Switch an app off to hide it from Launchpad.", xalign=0)
+        hint.add_css_class("meta")
+        panel.append(hint)
+        search = Gtk.SearchEntry()
+        search.set_placeholder_text("Filter apps")
+        panel.append(search)
+        scroller = Gtk.ScrolledWindow()
+        scroller.set_min_content_width(560)
+        scroller.set_min_content_height(min(520, int(self.H * 0.52)))
+        scroller.set_max_content_height(int(self.H * 0.6))
+        scroller.set_propagate_natural_height(True)
+        listbox = Gtk.ListBox()
+        listbox.set_selection_mode(Gtk.SelectionMode.NONE)
+        listbox.set_filter_func(lambda row: not search.get_text().strip()
+                                or search.get_text().strip().casefold() in row.app.key)
+        search.connect("search-changed", lambda e: listbox.invalidate_filter())
+        self.switches = []
+        for app in self.apps:
+            row = Gtk.ListBoxRow()
+            row.app = app
+            box = Gtk.Box(spacing=12)
+            box.set_margin_top(4)
+            box.set_margin_bottom(4)
+            box.set_margin_start(8)
+            box.set_margin_end(8)
+            img = Gtk.Image.new_from_gicon(icon_for(app))
+            img.set_pixel_size(36)
+            box.append(img)
+            label = Gtk.Label(label=app.name, xalign=0)
+            label.set_hexpand(True)
+            label.set_ellipsize(Pango.EllipsizeMode.END)
+            box.append(label)
+            switch = Gtk.Switch()
+            switch.set_valign(Gtk.Align.CENTER)
+            switch.set_active(app.id not in self.layout.hidden)
+            handler = switch.connect("notify::active", lambda s, p, app=app: self.on_visible_toggled(app, s.get_active()))
+            self.switches.append((switch, handler))
+            box.append(switch)
+            row.set_child(box)
+            listbox.append(row)
+        scroller.set_child(listbox)
+        panel.append(scroller)
+        foot = Gtk.Box(spacing=10)
+        sort = Gtk.Button(label="Sort A–Z, remove folders")
+        sort.add_css_class("text")
+        sort.connect("clicked", lambda b: (self.layout.reset(), self.build_pages()))
+        foot.append(sort)
+        show_all = Gtk.Button(label="Show all apps")
+        show_all.add_css_class("text")
+        show_all.connect("clicked", lambda b: self.show_all())
+        foot.append(show_all)
+        panel.append(foot)
+        self.spanel = panel
+        self.overlay.add_overlay(panel)
+        self.stack.add_css_class("dim")
+        search.grab_focus()
+
+    def on_visible_toggled(self, app, visible):
+        self.layout.set_hidden(app, not visible)
+        self.build_pages()
+
+    def show_all(self):
+        for app in self.apps:
+            self.layout.set_hidden(app, False)
+        for switch, handler in self.switches:                    # the layout is already updated: only the switches
+            switch.handler_block(handler)
+            switch.set_active(True)
+            switch.handler_unblock(handler)
+        self.build_pages()
+
+    def close_settings(self):
+        if self.spanel is None:
+            return
+        self.overlay.remove_overlay(self.spanel)
+        self.spanel = None
+        self.stack.remove_css_class("dim")
+        self.set_focus(None)
+
+    # -- scrolling -------------------------------------------------------------------------------------------------------
+
+    def on_scroll(self, ctrl, dx, dy):
+        if self.spanel is not None:
+            return Gdk.EVENT_PROPAGATE
+        now = time.monotonic()
+        wheel = ctrl.get_unit() == Gdk.ScrollUnit.WHEEL
+        delta = dy if abs(dy) >= abs(dx) else dx
+        self.scroll_acc += delta * (SWIPE_PX if wheel else 1.0)
+        if abs(self.scroll_acc) >= SWIPE_PX and now - self.last_scroll > PAGE_COOLDOWN_S:
+            self.go_page(self.page + (1 if self.scroll_acc > 0 else -1))
+            self.last_scroll = now
+            self.scroll_acc = 0.0
+        return Gdk.EVENT_STOP
+
+    # -- opening an app, closing ------------------------------------------------------------------------------------------
+
+    def launch(self, app):
+        try:
+            app.info.launch([], self.get_display().get_app_launch_context())
+        except GLib.Error as err:
+            print(f"launchpad-linux: could not start {app.name}: {err.message}", file=sys.stderr)
+        GLib.timeout_add(120, self.close_pad)       # let the launch (and its focus token) go out first
+
+    def on_active(self, *args):
+        if self.is_active():
+            self.was_active = True
+        elif self.was_active and not self.closing:
+            GLib.timeout_add(200, self.close_if_inactive)
+
+    def close_if_inactive(self):
+        if not self.is_active() and self.drag is None:
+            self.close_pad()
+        return GLib.SOURCE_REMOVE
+
+    def close_pad(self):
+        if not self.closing:
+            self.closing = True
+            self.commit_folder_name()
+            self.get_application().pad_closed(self)
+        return GLib.SOURCE_REMOVE
+
+
+# -- the tray icon: StatusNotifierItem + dbusmenu, straight on the session bus (no extra libraries) ---------------------------
+
+SNI_XML = """<node><interface name="org.kde.StatusNotifierItem">
+<property name="Category" type="s" access="read"/><property name="Id" type="s" access="read"/>
+<property name="Title" type="s" access="read"/><property name="Status" type="s" access="read"/>
+<property name="WindowId" type="i" access="read"/><property name="IconName" type="s" access="read"/>
+<property name="IconPixmap" type="a(iiay)" access="read"/><property name="OverlayIconName" type="s" access="read"/>
+<property name="AttentionIconName" type="s" access="read"/><property name="ToolTip" type="(sa(iiay)ss)" access="read"/>
+<property name="ItemIsMenu" type="b" access="read"/><property name="Menu" type="o" access="read"/>
+<method name="Activate"><arg type="i" direction="in"/><arg type="i" direction="in"/></method>
+<method name="SecondaryActivate"><arg type="i" direction="in"/><arg type="i" direction="in"/></method>
+<method name="ContextMenu"><arg type="i" direction="in"/><arg type="i" direction="in"/></method>
+<method name="Scroll"><arg type="i" direction="in"/><arg type="s" direction="in"/></method>
+<signal name="NewIcon"/><signal name="NewStatus"><arg type="s"/></signal><signal name="NewToolTip"/>
+</interface></node>"""
+
+MENU_XML = """<node><interface name="com.canonical.dbusmenu">
+<property name="Version" type="u" access="read"/><property name="TextDirection" type="s" access="read"/>
+<property name="Status" type="s" access="read"/><property name="IconThemePath" type="as" access="read"/>
+<method name="GetLayout"><arg type="i" direction="in"/><arg type="i" direction="in"/><arg type="as" direction="in"/>
+<arg type="u" direction="out"/><arg type="(ia{sv}av)" direction="out"/></method>
+<method name="GetGroupProperties"><arg type="ai" direction="in"/><arg type="as" direction="in"/>
+<arg type="a(ia{sv})" direction="out"/></method>
+<method name="GetProperty"><arg type="i" direction="in"/><arg type="s" direction="in"/><arg type="v" direction="out"/></method>
+<method name="Event"><arg type="i" direction="in"/><arg type="s" direction="in"/><arg type="v" direction="in"/>
+<arg type="u" direction="in"/></method>
+<method name="EventGroup"><arg type="a(isvu)" direction="in"/><arg type="ai" direction="out"/></method>
+<method name="AboutToShow"><arg type="i" direction="in"/><arg type="b" direction="out"/></method>
+<method name="AboutToShowGroup"><arg type="ai" direction="in"/><arg type="ai" direction="out"/><arg type="ai" direction="out"/></method>
+<signal name="ItemsPropertiesUpdated"><arg type="a(ia{sv})"/><arg type="a(ia{sv})"/></signal>
+<signal name="LayoutUpdated"><arg type="u"/><arg type="i"/></signal>
+<signal name="ItemActivationRequested"><arg type="i"/><arg type="u"/></signal>
+</interface></node>"""
+
+MENU_ITEMS = {1: ("Open Launchpad", "open"), 2: ("Settings…", "settings"), 3: (None, None), 4: ("Quit", "quit")}
+
+
+def _v(sig, value):
+    return GLib.Variant(sig, value)
+
+
+class Tray:
+    """A tray icon (StatusNotifierItem) with a small menu (dbusmenu); left click toggles Launchpad."""
+
+    def __init__(self, app):
+        self.app = app
+        self.bus = Gio.bus_get_sync(Gio.BusType.SESSION, None)
+        self.name = f"org.kde.StatusNotifierItem-{os.getpid()}-1"
+        self.sni = Gio.DBusNodeInfo.new_for_xml(SNI_XML).interfaces[0]
+        self.menu = Gio.DBusNodeInfo.new_for_xml(MENU_XML).interfaces[0]
+        self.bus.register_object("/StatusNotifierItem", self.sni, self.sni_call, self.sni_get, None)
+        self.bus.register_object("/MenuBar", self.menu, self.menu_call, self.menu_get, None)
+        Gio.bus_own_name_on_connection(self.bus, self.name, Gio.BusNameOwnerFlags.NONE, None, None)
+        Gio.bus_watch_name_on_connection(self.bus, "org.kde.StatusNotifierWatcher", Gio.BusNameWatcherFlags.NONE,
+                                         self.watcher_appeared, None)      # also when the shell restarts
+
+    def watcher_appeared(self, bus, name, owner):
+        bus.call("org.kde.StatusNotifierWatcher", "/StatusNotifierWatcher", "org.kde.StatusNotifierWatcher",
+                 "RegisterStatusNotifierItem", GLib.Variant("(s)", (self.name,)), None, Gio.DBusCallFlags.NONE,
+                 -1, None, None)
+
+    def sni_get(self, bus, sender, path, iface, prop):
+        values = {
+            "Category": _v("s", "ApplicationStatus"), "Id": _v("s", "launchpad-linux"), "Title": _v("s", "Launchpad"),
+            "Status": _v("s", "Active"), "WindowId": _v("i", 0), "IconName": _v("s", APP_ID),
+            "IconPixmap": _v("a(iiay)", []), "OverlayIconName": _v("s", ""), "AttentionIconName": _v("s", ""),
+            "ToolTip": _v("(sa(iiay)ss)", ("", [], "Launchpad", "Open the app launcher")),
+            "ItemIsMenu": _v("b", False), "Menu": _v("o", "/MenuBar"),
+        }
+        return values.get(prop)
+
+    def sni_call(self, bus, sender, path, iface, method, params, invocation):
+        if method in ("Activate", "SecondaryActivate"):
+            GLib.idle_add(self.app.toggle)
+        invocation.return_value(None)
+
+    def menu_get(self, bus, sender, path, iface, prop):
+        return {"Version": _v("u", 3), "TextDirection": _v("s", "ltr"), "Status": _v("s", "normal"),
+                "IconThemePath": _v("as", [])}.get(prop)
+
+    @staticmethod
+    def item_props(ident):
+        label, _ = MENU_ITEMS[ident]
+        if label is None:
+            return {"type": _v("s", "separator")}
+        return {"label": _v("s", label), "enabled": _v("b", True), "visible": _v("b", True)}
+
+    def menu_call(self, bus, sender, path, iface, method, params, invocation):
+        if method == "GetLayout":
+            children = [_v("(ia{sv}av)", (i, self.item_props(i), [])) for i in MENU_ITEMS]
+            root = (0, {"children-display": _v("s", "submenu")}, children)
+            invocation.return_value(GLib.Variant("(u(ia{sv}av))", (1, root)))
+        elif method == "GetGroupProperties":
+            ids = params.unpack()[0] or list(MENU_ITEMS)
+            invocation.return_value(GLib.Variant("(a(ia{sv}))", ([(i, self.item_props(i)) for i in ids if i in MENU_ITEMS],)))
+        elif method == "GetProperty":
+            ident, prop = params.unpack()
+            invocation.return_value(GLib.Variant("(v)", (self.item_props(ident).get(prop, _v("s", "")),)))
+        elif method == "Event":
+            ident, event, _data, _ts = params.unpack()
+            if event == "clicked" and ident in MENU_ITEMS:
+                GLib.idle_add(self.app.menu_action, MENU_ITEMS[ident][1])
+            invocation.return_value(None)
+        elif method == "EventGroup":
+            for ident, event, _data, _ts in params.unpack()[0]:
+                if event == "clicked" and ident in MENU_ITEMS:
+                    GLib.idle_add(self.app.menu_action, MENU_ITEMS[ident][1])
+            invocation.return_value(GLib.Variant("(ai)", ([],)))
+        elif method == "AboutToShow":
+            invocation.return_value(GLib.Variant("(b)", (False,)))
+        elif method == "AboutToShowGroup":
+            invocation.return_value(GLib.Variant("(aiai)", ([], [])))
+        else:
+            invocation.return_value(None)
+
+
+class App(Gtk.Application):
+    def __init__(self):
+        super().__init__(application_id=APP_ID, flags=Gio.ApplicationFlags.HANDLES_COMMAND_LINE)
+        self.win = None
+        self.tray = None
+        self.layout = None
+
+    def do_startup(self):
+        Gtk.Application.do_startup(self)
+        self.hold()                                  # stays running with the window closed: the tray icon is the app
+        try:
+            self.tray = Tray(self)
+        except GLib.Error as err:
+            print(f"launchpad-linux: no tray icon: {err.message}", file=sys.stderr)
+
+    def do_activate(self):                           # `gdbus call ... org.freedesktop.Application.Activate`: the fast toggle
+        self.toggle()
+
+    def do_command_line(self, cmdline):
+        args = cmdline.get_arguments()[1:]
+        if "--background" in args:
+            return 0
+        if "--quit" in args:
+            self.release()
+            self.quit()
+            return 0
+        self.toggle(settings="--settings" in args, open_only="--settings" in args)
+        return 0
+
+    def toggle(self, settings=False, open_only=False):
+        if self.win is not None:
+            if open_only:
+                self.win.open_settings()
+            else:
+                self.win.close_pad()
+            return GLib.SOURCE_REMOVE
+        apps = load_apps()
+        self.layout = Layout()
+        self.layout.load(apps)
+        self.win = Launchpad(self, apps, load_palette(), self.layout, settings=settings)
+        self.win.present()
+        return GLib.SOURCE_REMOVE
+
+    def pad_closed(self, win):
+        self.win = None
+        win.destroy()
+
+    def menu_action(self, action):
+        if action == "open":
+            if self.win is None:
+                self.toggle()
+        elif action == "settings":
+            self.toggle(settings=True, open_only=True)
+        elif action == "quit":
+            self.release()
+            self.quit()
+        return GLib.SOURCE_REMOVE
+
+
+def main():
+    if "--list" in sys.argv:
+        for item in load_apps():
+            print(item.name)
+        return 0
+    if "-h" in sys.argv or "--help" in sys.argv:
+        print(__doc__)
+        return 0
+    return App().run(sys.argv)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

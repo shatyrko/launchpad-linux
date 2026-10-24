@@ -1,0 +1,5 @@
+#!/bin/sh
+# Open / close Launchpad Linux at once (what keyboard shortcuts run): asks the background program over D-Bus,
+# which takes milliseconds; starts it when it is not running.
+gdbus call --session --dest dev.alecsh.LaunchpadLinux --object-path /dev/alecsh/LaunchpadLinux \
+    --method org.freedesktop.Application.Activate '{}' >/dev/null 2>&1 || exec launchpad-linux
