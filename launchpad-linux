@@ -655,6 +655,8 @@ class Launchpad(Gtk.ApplicationWindow):
             return ("background", None)
         cell = ancestor(widget, Cell)
         if cell is not None and self.spanel is None:
+            if self.folder is not None and cell not in self.fcells:
+                return ("background", None)         # the dimmed icons behind an open folder: a click closes the folder
             return ("cell", cell)
         if ancestor(widget, INTERACTIVE) is not None:
             return ("interactive", None)
