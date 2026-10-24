@@ -67,7 +67,7 @@ SWIPE_PX = 70.0             # touchpad scroll distance for one page
 HOVER_PX = 4.0              # the pointer must move this far before hovering selects
 STARTUP_S = 0.6             # pointer events while the window opens (layout settling, compositor) are not movement
 LONG_PRESS_MS = 450         # press and hold this long to pick an icon up
-MOVE_CANCEL_PX = 9.0        # moving this far before that is a wiggle, not a pick-up
+MOVE_CANCEL_PX = 12.0       # pressing and moving this far picks the icon up at once (a mouse drag, a three finger drag)
 EDGE_PX = 70                # holding a dragged icon this close to the screen edge turns the page
 EDGE_MS = 650
 
@@ -428,6 +428,9 @@ class Launchpad(Gtk.ApplicationWindow):
             grid.set_size_request(*self.grid_size)
             self.stack.add_named(grid, f"p{page}")
             self.pages.append(grid)
+        for grid in self.pages:      # a short page keeps the same rows: empty ones still hold their height
+            for row in range(self.rows):
+                grid.attach(Gtk.Box(), 0, row, 1, 1)
         for i, entry in enumerate(self.entries):
             cell = self.make_cell(entry)
             self.cells.append(cell)
@@ -699,7 +702,9 @@ class Launchpad(Gtk.ApplicationWindow):
             x, y = self.event_xy(event)
             if self.pending is not None and self.pending["cell"] is not None:
                 if math.hypot(x - self.pending["x"], y - self.pending["y"]) > MOVE_CANCEL_PX:
-                    self.cancel_press()
+                    GLib.source_remove(self.pending["timer"])
+                    self.pending.update(x=x, y=y, timer=0)
+                    self.begin_drag()
             if self.drag is not None:
                 self.drag_to(x, y)
             return False
