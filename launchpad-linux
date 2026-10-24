@@ -33,6 +33,7 @@ import sys
 import time
 import tomllib
 import urllib.parse
+from types import SimpleNamespace
 
 HERE = os.path.dirname(os.path.realpath(__file__))
 sys.path.insert(0, HERE)
@@ -63,7 +64,9 @@ APP_ID = "dev.alecsh.LaunchpadLinux"
 NAMESPACE = "launchpad-linux"
 TYPE_RESET_S = 1.3          # typed letters are forgotten after this long without typing
 PAGE_COOLDOWN_S = 0.35      # scrolling changes one page per this
-SWIPE_PX = 70.0             # touchpad scroll distance for one page
+SWIPE_GAIN = 2.2            # touchpad scroll units to pixels while the pages follow the fingers
+SWIPE_SETTLE_MS = 110       # no scroll events for this long: the swipe is over
+SWIPE_FLIP = 0.16           # dragged past this much of a page: go to the next one
 HOVER_PX = 4.0              # the pointer must move this far before hovering selects
 STARTUP_S = 0.6             # pointer events while the window opens (layout settling, compositor) are not movement
 LONG_PRESS_MS = 450         # press and hold this long to pick an icon up
@@ -148,7 +151,9 @@ button.gear:hover {{ background-color: {rgba(p['mHover'], 0.55)}; color: {p['mOn
 .panel row:hover {{ background-color: {rgba(p['mHover'], 0.4)}; }}
 .panel entry, .panel searchentry {{ background-color: {rgba(p['mSurfaceVariant'], 0.8)}; color: {p['mOnSurface']};
   border-radius: 14px; box-shadow: inset 0 0 0 1px {rgba(p['mOutline'], 0.5)}; }}
-.panel entry.panel-title {{ background: none; box-shadow: none; }}
+.panel entry.panel-title, .panel entry.panel-title:focus, .panel entry.panel-title:focus-within {{
+  background: none; box-shadow: none; border: none; outline: none; outline-width: 0; outline-color: transparent; }}
+.panel entry.panel-title text, .panel entry.panel-title text:focus {{ background: none; box-shadow: none; outline: none; outline-width: 0; }}
 .panel button.text {{ background-color: {rgba(p['mSurfaceVariant'], 0.9)}; color: {p['mOnSurface']}; border-radius: 14px;
   border: none; box-shadow: inset 0 0 0 1px {rgba(p['mOutline'], 0.5)}; padding: 8px 16px; }}
 .panel button.text:hover {{ background-color: {rgba(p['mHover'], 0.9)}; }}
@@ -280,7 +285,8 @@ class Launchpad(Gtk.ApplicationWindow):
         self.last_ptr = None
         self.base_ptr = None
         self.last_scroll = 0.0
-        self.scroll_acc = 0.0
+        self.slide_id = 0                  # the running page slide (a timeout)
+        self.swipe = None                  # a touchpad swipe in progress: {"page": where it began, "timer": settle timer}
         self.was_active = False
         self.closing = False
         self.opened = time.monotonic()
@@ -324,6 +330,7 @@ class Launchpad(Gtk.ApplicationWindow):
         motion.connect("enter", self.on_motion)
         self.add_controller(motion)
         scroll = Gtk.EventControllerScroll(flags=Gtk.EventControllerScrollFlags.BOTH_AXES)
+        scroll.set_propagation_phase(Gtk.PropagationPhase.CAPTURE)
         scroll.connect("scroll", self.on_scroll)
         self.add_controller(scroll)
         legacy = Gtk.EventControllerLegacy()
@@ -368,14 +375,18 @@ class Launchpad(Gtk.ApplicationWindow):
         pill_box.append(self.pill)
         self.root.append(pill_box)
 
-        self.stack = Gtk.Stack()
+        # the pages side by side in a scroll view that has no bars: the touchpad drags it, then it settles on a page
+        self.stack = Gtk.ScrolledWindow()
         self.stack.add_css_class("pages")
-        self.stack.set_transition_type(Gtk.StackTransitionType.SLIDE_LEFT_RIGHT)
-        self.stack.set_transition_duration(280)
+        self.stack.set_policy(Gtk.PolicyType.EXTERNAL, Gtk.PolicyType.NEVER)
+        self.stack.set_kinetic_scrolling(False)
         self.stack.set_hexpand(True)
         self.stack.set_vexpand(True)
-        self.stack.set_halign(Gtk.Align.CENTER)
+        self.stack.set_halign(Gtk.Align.FILL)
         self.stack.set_valign(Gtk.Align.CENTER)
+        self.strip = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL)
+        self.stack.set_child(self.strip)
+        self.stack.set_size_request(w, self.grid_size[1])
         self.root.append(self.stack)
 
         self.dots_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=14)
@@ -424,8 +435,8 @@ class Launchpad(Gtk.ApplicationWindow):
         """(Re)create every page from the layout; keep = the entry to select afterwards."""
         if keep is None and self.entries and 0 <= self.sel < len(self.entries):
             keep = self.entries[self.sel]
-        self.clear(self.stack)
-        self.entries = list(self.layout.root)
+        self.clear(self.strip)
+        self.entries = self.layout.shown()
         self.cells, self.pages = [], []
         count = max(1, math.ceil(len(self.entries) / self.per))
         for page in range(count):
@@ -435,7 +446,11 @@ class Launchpad(Gtk.ApplicationWindow):
             grid.set_column_homogeneous(True)
             grid.set_row_homogeneous(True)
             grid.set_size_request(*self.grid_size)
-            self.stack.add_named(grid, f"p{page}")
+            wrapper = Gtk.Box()
+            wrapper.set_size_request(self.W, -1)
+            wrapper.set_hexpand(False)
+            wrapper.append(grid)
+            self.strip.append(wrapper)
             self.pages.append(grid)
         for grid in self.pages:      # a short page keeps the same rows: empty ones still hold their height
             for row in range(self.rows):
@@ -482,11 +497,33 @@ class Launchpad(Gtk.ApplicationWindow):
         if page != self.page:
             animated = animate and self.page >= 0
             self.page = page
-            self.stack.set_transition_type(Gtk.StackTransitionType.SLIDE_LEFT_RIGHT if animated else Gtk.StackTransitionType.NONE)
-            self.stack.set_visible_child_name(f"p{page}")
-            self.stack.set_transition_type(Gtk.StackTransitionType.SLIDE_LEFT_RIGHT)
+            self.show_page(page, animated)
         for n, dot in enumerate(self.dots):
             (dot.add_css_class if n == page else dot.remove_css_class)("on")
+
+    def show_page(self, page, animated=True):
+        """Slide (or jump) the pager to a page."""
+        adj = self.stack.get_hadjustment()
+        if self.slide_id:
+            GLib.source_remove(self.slide_id)
+            self.slide_id = 0
+        target = page * self.W
+        if not animated or adj.get_upper() < target + self.W - 1:
+            adj.set_value(target)
+            if not animated:
+                GLib.idle_add(lambda: adj.set_value(self.page * self.W) and False)     # once the pages have a size
+            return
+        start, t0 = adj.get_value(), time.monotonic()
+
+        def step():
+            t = min(1.0, (time.monotonic() - t0) / 0.26)
+            eased = 1 - (1 - t) ** 3
+            adj.set_value(start + (target - start) * eased)
+            if t >= 1.0:
+                self.slide_id = 0
+                return GLib.SOURCE_REMOVE
+            return GLib.SOURCE_CONTINUE
+        self.slide_id = GLib.timeout_add(8, step)
 
     def go_page(self, page):
         if self.folder is not None or self.spanel is not None:
@@ -667,7 +704,8 @@ class Launchpad(Gtk.ApplicationWindow):
             if self.folder is not None and cell not in self.fcells:
                 return ("background", None)         # the dimmed icons behind an open folder: a click closes the folder
             return ("cell", cell)
-        if ancestor(widget, INTERACTIVE) is not None:
+        inter = ancestor(widget, INTERACTIVE)
+        if inter is not None and inter is not self.stack:
             return ("interactive", None)
         if has_class(widget, "panel"):
             return ("panel", None)
@@ -786,10 +824,12 @@ class Launchpad(Gtk.ApplicationWindow):
         d = self.drag
         widget = self.pick(x, y, Gtk.PickFlags.DEFAULT)
         cell = ancestor(widget, Cell) if widget is not None else None
+        if cell is not None and cell is d["cell"]:
+            return ("self", None)                    # back over its own place: nothing changes
         if self.folder is not None:
-            if cell is None or cell is d["cell"] or cell not in self.fcells:
+            if cell is None or cell not in self.fcells:
                 return ("end", None) if has_class(widget, "panel") else ("leave", None)
-        elif cell is None or cell is d["cell"] or cell not in self.cells:
+        elif cell is None or cell not in self.cells:
             return ("end", None) if widget is not None else None
         ok, rect = cell.compute_bounds(self)
         if not ok:
@@ -815,7 +855,7 @@ class Launchpad(Gtk.ApplicationWindow):
     def apply_drop(self, d, target):
         lay = self.layout
         entry, folder = d["entry"], d["folder"]
-        if target is None:
+        if target is None or target[0] == "self":
             return
         action, cell = target
         if folder is not None:                                    # an app taken from the open folder
@@ -962,7 +1002,7 @@ class Launchpad(Gtk.ApplicationWindow):
         done.connect("clicked", lambda b: self.close_settings())
         head.append(done)
         panel.append(head)
-        hint = Gtk.Label(label="Switch an app off to hide it from Launchpad.", xalign=0)
+        hint = Gtk.Label(label="Switch an app or a folder off to hide it from Launchpad.", xalign=0)
         hint.add_css_class("meta")
         panel.append(hint)
         search = Gtk.SearchEntry()
@@ -979,6 +1019,32 @@ class Launchpad(Gtk.ApplicationWindow):
                                 or search.get_text().strip().casefold() in row.app.key)
         search.connect("search-changed", lambda e: listbox.invalidate_filter())
         self.switches = []
+        self.folder_switches = []
+        for folder in self.layout.folders():            # folders first: switch one off to hide it (and its apps)
+            row = Gtk.ListBoxRow()
+            row.app = SimpleNamespace(key=folder.name.casefold())
+            box = Gtk.Box(spacing=12)
+            box.set_margin_top(4)
+            box.set_margin_bottom(4)
+            box.set_margin_start(8)
+            box.set_margin_end(8)
+            img = Gtk.Image.new_from_icon_name("folder-symbolic")
+            img.set_pixel_size(28)
+            img.set_margin_start(4)
+            img.set_margin_end(4)
+            box.append(img)
+            label = Gtk.Label(label=f"{folder.name}  (folder, {len(folder.apps)} apps)", xalign=0)
+            label.set_hexpand(True)
+            label.set_ellipsize(Pango.EllipsizeMode.END)
+            box.append(label)
+            switch = Gtk.Switch()
+            switch.set_valign(Gtk.Align.CENTER)
+            switch.set_active(not folder.hidden)
+            handler = switch.connect("notify::active", lambda s, p, f=folder: self.on_folder_toggled(f, s.get_active()))
+            self.folder_switches.append((switch, handler))
+            box.append(switch)
+            row.set_child(box)
+            listbox.append(row)
         for app in self.apps:
             row = Gtk.ListBoxRow()
             row.app = app
@@ -1019,6 +1085,10 @@ class Launchpad(Gtk.ApplicationWindow):
         self.stack.add_css_class("dim")
         search.grab_focus()
 
+    def on_folder_toggled(self, folder, visible):
+        self.layout.set_folder_hidden(folder, not visible)
+        self.build_pages()
+
     def on_visible_toggled(self, app, visible):
         self.layout.set_hidden(app, not visible)
         self.build_pages()
@@ -1026,7 +1096,9 @@ class Launchpad(Gtk.ApplicationWindow):
     def show_all(self):
         for app in self.apps:
             self.layout.set_hidden(app, False)
-        for switch, handler in self.switches:                    # the layout is already updated: only the switches
+        for folder in self.layout.folders():
+            self.layout.set_folder_hidden(folder, False)
+        for switch, handler in self.switches + self.folder_switches:   # the layout is already updated: only the switches
             switch.handler_block(handler)
             switch.set_active(True)
             switch.handler_unblock(handler)
@@ -1045,15 +1117,40 @@ class Launchpad(Gtk.ApplicationWindow):
     def on_scroll(self, ctrl, dx, dy):
         if self.spanel is not None:
             return Gdk.EVENT_PROPAGATE
-        now = time.monotonic()
-        wheel = ctrl.get_unit() == Gdk.ScrollUnit.WHEEL
+        if self.folder is not None or not self.cells:
+            return Gdk.EVENT_STOP
         delta = dy if abs(dy) >= abs(dx) else dx
-        self.scroll_acc += delta * (SWIPE_PX if wheel else 1.0)
-        if abs(self.scroll_acc) >= SWIPE_PX and now - self.last_scroll > PAGE_COOLDOWN_S:
-            self.go_page(self.page + (1 if self.scroll_acc > 0 else -1))
-            self.last_scroll = now
-            self.scroll_acc = 0.0
+        if ctrl.get_unit() == Gdk.ScrollUnit.WHEEL:       # a wheel notch: one page
+            now = time.monotonic()
+            if now - self.last_scroll > PAGE_COOLDOWN_S:
+                self.go_page(self.page + (1 if delta > 0 else -1))
+                self.last_scroll = now
+            return Gdk.EVENT_STOP
+        # a touchpad: the pages follow the fingers, then settle on the nearest page
+        adj = self.stack.get_hadjustment()
+        if self.swipe is None:
+            if self.slide_id:
+                GLib.source_remove(self.slide_id)
+                self.slide_id = 0
+            self.swipe = {"page": self.page, "timer": 0}
+        elif self.swipe["timer"]:
+            GLib.source_remove(self.swipe["timer"])
+        top = max(0.0, adj.get_upper() - adj.get_page_size())
+        adj.set_value(max(0.0, min(top, adj.get_value() + delta * SWIPE_GAIN)))
+        self.swipe["timer"] = GLib.timeout_add(SWIPE_SETTLE_MS, self.swipe_end)
         return Gdk.EVENT_STOP
+
+    def swipe_end(self):
+        swipe, self.swipe = self.swipe, None
+        if swipe is None:
+            return GLib.SOURCE_REMOVE
+        moved = self.stack.get_hadjustment().get_value() / self.W - swipe["page"]
+        page = swipe["page"] + (1 if moved > SWIPE_FLIP else -1 if moved < -SWIPE_FLIP else 0)
+        page = max(0, min(len(self.pages) - 1, page))
+        if page != self.page:
+            self.select_root(min(len(self.cells) - 1, page * self.per + (self.sel % self.per)), animate=False)
+        self.show_page(page, True)
+        return GLib.SOURCE_REMOVE
 
     # -- opening an app, closing ------------------------------------------------------------------------------------------
 

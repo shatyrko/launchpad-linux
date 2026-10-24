@@ -83,6 +83,16 @@ assert [e.name for e in lay.root] == sorted([e.name for e in lay.root], key=str.
 assert "Zed" not in names(lay) and not lay.custom
 assert "items" not in json.load(open(path))
 
+# a hidden folder is kept (with its apps) but not shown
+lay7, apps7 = make(["Aa", "Bb", "Cc"], path)
+folder = lay7.make_folder(lay7.root[0], lay7.detach(entry=lay7.root[1]))
+lay7.set_folder_hidden(folder, True)
+assert [e.name for e in lay7.shown()] == ["Cc"] and len(lay7.folders()) == 1
+lay8, _ = make(["Aa", "Bb", "Cc"], path)
+assert lay8.folders()[0].hidden and [e.name for e in lay8.shown()] == ["Cc"]
+lay8.set_folder_hidden(lay8.folders()[0], False)
+assert len(lay8.shown()) == 2
+
 # a broken file is ignored
 open(path, "w").write("{not json")
 lay6, _ = make(["B", "A"], path)

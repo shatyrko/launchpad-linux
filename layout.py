@@ -35,9 +35,10 @@ class AppEntry:
 class FolderEntry:
     kind = "folder"
 
-    def __init__(self, name, apps):
+    def __init__(self, name, apps, hidden=False):
         self.name = name or DEFAULT_FOLDER_NAME
         self.apps = list(apps)
+        self.hidden = hidden          # kept (with its apps) but not shown
 
     @property
     def key(self):
@@ -84,7 +85,7 @@ class Layout:
                         apps.append(app)
                         placed.add(ident)
                 if apps:
-                    self.root.append(FolderEntry(str(item.get("folder") or DEFAULT_FOLDER_NAME), apps))
+                    self.root.append(FolderEntry(str(item.get("folder") or DEFAULT_FOLDER_NAME), apps, bool(item.get("hidden"))))
         rest = sorted((a for a in self.all_apps if a.id not in placed), key=lambda a: a.key)
         self.root += [AppEntry(a) for a in rest]
         self.cleanup()
@@ -95,7 +96,10 @@ class Layout:
             if entry.kind == "app":
                 items.append(entry.app.id)
             else:
-                items.append({"folder": entry.name, "apps": [a.id for a in entry.apps]})
+                folder = {"folder": entry.name, "apps": [a.id for a in entry.apps]}
+                if entry.hidden:
+                    folder["hidden"] = True
+                items.append(folder)
         data = {"version": 1, "hidden": sorted(self.hidden)}
         if self.custom:
             data["items"] = items
@@ -107,6 +111,17 @@ class Layout:
         with open(tmp, "w") as f:
             json.dump(self.to_json(), f, indent=1, ensure_ascii=False)
         os.replace(tmp, self.path)
+
+    def shown(self):
+        """The entries to draw: everything except hidden folders."""
+        return [e for e in self.root if not (e.kind == "folder" and e.hidden)]
+
+    def folders(self):
+        return [e for e in self.root if e.kind == "folder"]
+
+    def set_folder_hidden(self, folder, hidden):
+        folder.hidden = hidden
+        self._touch()
 
     # -- queries -------------------------------------------------------------------------------------------------------
 

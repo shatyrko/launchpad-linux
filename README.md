@@ -8,10 +8,10 @@ but it only needs a compositor with layer-shell.
 - **Keyboard first**: arrows, Enter, Esc, Page Up / Down; **type the first letters of an app to jump to it**.
   The mouse pointer hides the moment you use the keyboard, and hovering only selects after the mouse really moves,
   so a resting pointer never highlights the wrong icon.
-- **Mouse**: click an app, click the background to close, wheel or two-finger swipe for the next page.
+- **Mouse**: click an app, click the background to close, the wheel turns a page; a two-finger swipe drags the pages along with your fingers and settles on the nearest one.
 - **Rearrange like Launchpad**: press an icon and drag it (mouse, or a three finger drag; a long press picks it up too); drop on an icon's edge to put it there, on its
   middle to make a **folder** (rename it by clicking its name); hold at the screen edge to turn the page.
-- **Settings** (gear, or Ctrl+,): hide apps from Launchpad, sort A to Z again.
+- **Settings** (gear, or Ctrl+,): hide apps or whole folders from Launchpad, sort A to Z again.
 - **Background app with a tray icon**: starts at login, `launchpad-toggle` opens / closes it in milliseconds.
 - **Theme**: colours from the active Noctalia palette, font from GTK; falls back to Catppuccin Mocha.
 
