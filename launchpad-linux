@@ -127,7 +127,7 @@ window.launchpad {{ background-color: {rgba(p['mSurface'], 0.52)}; }}
 .cell.drop-after {{ box-shadow: inset -5px 0 0 0 {p['mPrimary']}; }}
 .cell .name {{ color: {p['mOnSurface']}; font-size: 15px; font-weight: 500; text-shadow: 0 1px 6px {rgba(p['mSurface'], 0.9)}; }}
 .folder-icon {{ background-color: {rgba(p['mSurfaceVariant'], 0.62)}; border-radius: {int(icon * 0.26)}px;
-  box-shadow: inset 0 0 0 1px {rgba(p['mOutline'], 0.55)}; padding: {int(icon * 0.09)}px; }}
+  box-shadow: inset 0 0 0 1px {rgba(p['mOutline'], 0.55)}; padding: {int(icon * 0.07)}px; }}
 .ghost {{ opacity: 0.92; }}
 .typed {{ background-color: {rgba(p['mSurfaceVariant'], 0.86)}; color: {p['mOnSurface']}; border-radius: 999px;
   padding: 9px 26px; font-size: 19px; box-shadow: inset 0 0 0 1px {rgba(p['mOutline'], 0.6)}; opacity: 0; transition: opacity 150ms; }}
@@ -190,7 +190,8 @@ def make_icon(entry, icon: int) -> Gtk.Widget:
     if entry.kind == "folder":
         box = Gtk.Box()
         box.add_css_class("folder-icon")
-        box.set_size_request(icon, icon)
+        side = int(icon * 1.08)                    # a folder looks small next to full-bleed app icons
+        box.set_size_request(side, side)
         box.set_halign(Gtk.Align.CENTER)
         box.set_valign(Gtk.Align.CENTER)          # stays square in a taller cell
         grid = Gtk.Grid()
@@ -198,7 +199,7 @@ def make_icon(entry, icon: int) -> Gtk.Widget:
         grid.set_column_homogeneous(True)
         grid.set_hexpand(True)
         grid.set_vexpand(True)
-        mini = max(16, int(icon * 0.26))
+        mini = max(16, int(icon * 0.31))
         for n, app in enumerate(entry.apps[:9]):
             img = Gtk.Image.new_from_gicon(icon_for(app))
             img.set_pixel_size(mini)
